@@ -1,0 +1,264 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Servo.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_BMP085.h>
+
+// Sensor Pin Definitions
+#define DHTPIN 12             // D6 on NodeMCU
+#define DHTTYPE DHT22
+#define MQ2_POWER_PIN 13      // D7 (Switches MQ2 Power)
+#define SOIL_POWER_PIN 15     // D8 (Switches Soil Moisture Power)
+#define LDR_PIN 0             // D3 Digital Threshold input
+#define ANALOG_PIN A0         // Shared A0 Line
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BMP085 bmp;
+Servo probeServo;
+ESP8266WebServer server(81);  // Sensor hub hosted on port 81
+
+// Global Environment State Variables
+float temperature = 0.0;
+float humidity = 0.0;
+float pressure = 1013.25;
+float altitude = 0.0;
+float baselinePressure = 1013.25;
+int gasRaw = 0;
+int soilMoistureRaw = 0;
+float soilMoisturePercent = 0.0;
+bool isDaylight = true;
+float vpd = 0.0;
+String rainWarning = "No Rain Threat Detected";
+String vpdRisk = "VPD Within Normal Parameters";
+
+// Servo Positions
+const int RETRACT_ANGLE = 0;
+const int DEPLOY_ANGLE = 90;
+
+// Algorithm: Vapor Pressure Deficit (VPD)
+void calculateVPD() {
+  if (temperature <= 0) return;
+  // Saturation Vapor Pressure (es) in kPa using Tetens equation
+  float es = 0.61078 * exp((17.27 * temperature) / (temperature + 237.3));
+  // Actual Vapor Pressure (ea) in kPa
+  float ea = es * (humidity / 100.0);
+  vpd = es - ea;
+
+  if (vpd > 1.2) {
+    vpdRisk = "High Transpiration Risk: Optimize Root Irrigation";
+  } else if (vpd < 0.4) {
+    vpdRisk = "High Pathogen Risk: Excessive Humidity / Fungal Risk";
+  } else {
+    vpdRisk = "Normal Growth Parameters";
+  }
+}
+
+// Algorithm: Sliding Window Rainfall Forecasting (dP/dt)
+void processWeatherForecast() {
+  float currentPressure = bmp.readPressure() / 100.0; // convert to hPa
+  // If local pressure drops quickly below the sliding hourly average and humidity is high
+  float diff = currentPressure - baselinePressure;
+  if (diff < -1.0 && humidity > 75.0) {
+    rainWarning = "CRITICAL: Heavy Rain Forecasted in 3-5 Hours!";
+  } else {
+    rainWarning = "Stable Atmospheric Conditions";
+  }
+}
+
+// Function: Safe Sequenced Single-A0 Readings
+void performMultiplexedReadings() {
+  // Read MQ2 Sensor
+  digitalWrite(MQ2_POWER_PIN, HIGH);
+  digitalWrite(SOIL_POWER_PIN, LOW);
+  delay(50); // Let voltage settle
+  gasRaw = analogRead(ANALOG_PIN);
+  digitalWrite(MQ2_POWER_PIN, LOW);
+
+  // Read Soil Moisture (We read this when deployed, but provide manual trigger)
+  digitalWrite(SOIL_POWER_PIN, HIGH);
+  delay(50); // Let voltage settle
+  soilMoistureRaw = analogRead(ANALOG_PIN);
+  digitalWrite(SOIL_POWER_PIN, LOW);
+
+  // Calibration mapping: Wet threshold (approx 350) and Dry threshold (approx 850)
+  soilMoisturePercent = map(soilMoistureRaw, 850, 350, 0, 100);
+  soilMoisturePercent = constrain(soilMoisturePercent, 0, 100);
+}
+
+// Servo Actuation deployment sequence
+void runDeploymentCycle() {
+  probeServo.write(DEPLOY_ANGLE);
+  delay(2000); // Wait for servo to insert the capacitive probe
+
+  // Take deep reading of soil moisture
+  digitalWrite(SOIL_POWER_PIN, HIGH);
+  delay(100);
+  soilMoistureRaw = analogRead(ANALOG_PIN);
+  digitalWrite(SOIL_POWER_PIN, LOW);
+  
+  soilMoisturePercent = map(soilMoistureRaw, 850, 350, 0, 100);
+  soilMoisturePercent = constrain(soilMoisturePercent, 0, 100);
+
+  // Auto-retract to protect sensor probe during navigation
+  probeServo.write(RETRACT_ANGLE);
+  delay(1500); 
+}
+
+// HTTP Response for ESP32 Dashboard
+void handleDeploy() {
+  runDeploymentCycle();
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "text/plain", String(soilMoisturePercent));
+}
+
+// Root JSON data endpoint for asynchronous UI fetches
+void handleDataJSON() {
+  String json = "{";
+  json += "\"temp\":" + String(temperature) + ",";
+  json += "\"humidity\":" + String(humidity) + ",";
+  json += "\"pressure\":" + String(pressure) + ",";
+  json += "\"gas\":" + String(gasRaw) + ",";
+  json += "\"soil\":" + String(soilMoisturePercent) + ",";
+  json += "\"vpd\":" + String(vpd) + ",";
+  json += "\"daylight\":" + String(isDaylight ? "true" : "false") + ",";
+  json += "\"rain\":\"" + rainWarning + "\",";
+  json += "\"vpdRisk\":\"" + vpdRisk + "\"";
+  json += "}";
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+// Dashboard Webpage
+void handleDashboard() {
+  String dashboardHTML = R"rawliteral(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <title>Agribot Analytical Console</title>
+    <style>
+      body { font-family: sans-serif; background: #0f172a; color: #f8fafc; text-align: center; margin: 0; padding: 20px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; max-width: 900px; margin: 20px auto; }
+      .card { background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
+      h1 { color: #38bdf8; }
+      .alert-box { padding: 15px; margin: 20px auto; max-width: 900px; border-radius: 8px; font-weight: bold; background: #991b1b; }
+      .alert-normal { background: #065f46; }
+      .val { font-size: 28px; font-weight: bold; color: #38bdf8; margin: 10px 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Precision Agribot Analytics</h1>
+    <div class="alert-box alert-normal" id="weatherAlert">Stable Atmospheric Conditions</div>
+    <div class="alert-box" id="vpdAlert">Evaluating Leaf VPD State...</div>
+
+    <div class="grid">
+      <div class="card"><h3>Soil Volumetric Moisture</h3><div class="val" id="soilVal">-- %</div><p>Root Deep Reading</p></div>
+      <div class="card"><h3>Temperature / RH</h3><div class="val" id="tempVal">-- °C</div><p id="humVal">-- % RH</p></div>
+      <div class="card"><h3>Atmospheric Pressure</h3><div class="val" id="pressVal">-- hPa</div><p id="altVal">-- m Altitude</p></div>
+      <div class="card"><h3>Combustible Gases / VOC</h3><div class="val" id="gasVal">-- ppm</div><p>Air Diagnostics</p></div>
+    </div>
+
+    <script>
+      function updateDashboard() {
+        fetch('/data')
+          .then(res => res.json())
+          .then(data => {
+            document.getElementById('soilVal').innerText = data.soil + ' %';
+            document.getElementById('tempVal').innerText = data.temp + ' °C';
+            document.getElementById('humVal').innerText = data.humidity + ' % RH';
+            document.getElementById('pressVal').innerText = data.pressure + ' hPa';
+            document.getElementById('altVal').innerText = data.vpd.toFixed(2) + ' kPa VPD';
+            document.getElementById('gasVal').innerText = data.gas + ' RAW';
+            
+            // Forecast UI toggles
+            const wAlert = document.getElementById('weatherAlert');
+            wAlert.innerText = data.rain;
+            if (data.rain.includes("CRITICAL")) {
+              wAlert.className = "alert-box";
+            } else {
+              wAlert.className = "alert-box alert-normal";
+            }
+
+            const vAlert = document.getElementById('vpdAlert');
+            vAlert.innerText = "VPD Risk: " + data.vpdRisk;
+            if (data.vpdRisk.includes("Risk")) {
+              vAlert.className = "alert-box";
+            } else {
+              vAlert.className = "alert-box alert-normal";
+            }
+          });
+      }
+      setInterval(updateDashboard, 2000);
+      updateDashboard();
+    </script>
+  </body>
+  </html>
+  )rawliteral";
+  server.send(200, "text/html", dashboardHTML);
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(MQ2_POWER_PIN, OUTPUT);
+  pinMode(SOIL_POWER_PIN, OUTPUT);
+  pinMode(LDR_PIN, INPUT);
+
+  dht.begin();
+  if (!bmp.begin()) {
+    // BMP180 sensor initialization check
+  } else {
+    baselinePressure = bmp.readPressure() / 100.0;
+  }
+
+  probeServo.attach(14); // D5
+  probeServo.write(RETRACT_ANGLE);
+
+  // Setup networking profile as a client to connect with ESP32-CAM AP
+  WiFi.begin("SmartAgribot", "Password123");
+  
+  // Set Static IP configuration matching the network architecture
+  IPAddress ip(192.168.4.2);
+  IPAddress gateway(192.168.4.1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(ip, gateway, subnet);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  server.on("/", handleDashboard);
+  server.on("/data", handleDataJSON);
+  server.on("/deploy", handleDeploy);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Run Non-blocking periodic hardware polls
+  static unsigned long lastSensorPoll = 0;
+  if (millis() - lastSensorPoll > 3000) {
+    lastSensorPoll = millis();
+
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    
+    if (isnan(temperature) || isnan(humidity)) {
+      temperature = 28.5; // Fail-safe default
+      humidity = 60.0;
+    }
+
+    if (bmp.begin()) {
+      pressure = bmp.readPressure() / 100.0;
+      altitude = bmp.readAltitude();
+    }
+
+    isDaylight = (digitalRead(LDR_PIN) == LOW); // LDR is Active LOW
+    
+    performMultiplexedReadings();
+    calculateVPD();
+    processWeatherForecast();
+  }
+}
