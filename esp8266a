@@ -1,0 +1,83 @@
+#include <Arduino.h>
+
+// L298N Motor Driver Pin Definitions
+const int ENA = 14; // D5 (PWM Pin Speed Control Left Side)
+const int IN1 = 5;  // D1
+const int IN2 = 4;  // D2
+const int IN3 = 0;  // D3
+const int IN4 = 2;  // D4
+const int ENB = 12; // D6 (PWM Pin Speed Control Right Side)
+
+const int RUNNING_SPEED = 200; // Base speed limit (0-255 scaling)
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void moveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, RUNNING_SPEED);
+  analogWrite(ENB, RUNNING_SPEED);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, RUNNING_SPEED);
+  analogWrite(ENB, RUNNING_SPEED);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, RUNNING_SPEED);
+  analogWrite(ENB, RUNNING_SPEED);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, RUNNING_SPEED);
+  analogWrite(ENB, RUNNING_SPEED);
+}
+
+void setup() {
+  Serial.begin(115200); // Receive commands from ESP32-CAM via serial bus
+  
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    switch (cmd) {
+      case 'F': moveForward();  break;
+      case 'B': moveBackward(); break;
+      case 'L': turnLeft();      break;
+      case 'R': turnRight();     break;
+      case 'S': stopMotors();    break;
+      default:  stopMotors();    break;
+    }
+  }
+}
